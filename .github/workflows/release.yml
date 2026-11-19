@@ -244,6 +244,10 @@ jobs:
 
   cli:
     needs: [version, efi]
+    # A test build is written from Linux or Windows. GitHub's macOS runners
+    # can be out of capacity for hours, and a job none of them takes fails:
+    # outside a release that does not fail the run.
+    continue-on-error: ${{ github.ref_type != 'tag' && matrix.platform == 'macos-universal' }}
     strategy:
       fail-fast: false
       matrix:
