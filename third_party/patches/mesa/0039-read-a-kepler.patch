@@ -1,0 +1,291 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 11:47:50 +0000
+Subject: [PATCH] nak, nvk: read a Kepler storage image without a format by its
+ descriptor's
+
+Kepler's suldga returns raw texels that the shader unpacks, so a storage
+read needed its format when the shader was compiled, and NVK had no
+shaderStorageImageReadWithoutFormat before Maxwell. The image view's
+format is in its descriptor all the same: format_info holds the
+hardware's format number with the size and count of its components,
+which sustga already converts stores by.
+
+A load that names no format now reads that word. The texel's size
+selects which raw load runs, so no load reads past the image's last
+texel, and the format's kind (float, signed, unsigned, normalized,
+packed) selects the conversion, each kind unpacked as its
+four-component format of that component size with the components the
+format lacks filled in after. The formats are those nil's su_info.rs
+gives a Kepler storage descriptor.
+
+A shader that names the format keeps the single load it had.
+---
+ .../compiler/nak_nir_lower_image_addrs.c      | 196 ++++++++++++++++++
+ src/nouveau/vulkan/nvk_buffer_view.c          |   5 +-
+ src/nouveau/vulkan/nvk_image.c                |   5 +-
+ src/nouveau/vulkan/nvk_physical_device.c      |   5 +-
+ 4 files changed, 204 insertions(+), 7 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak_nir_lower_image_addrs.c b/src/nouveau/compiler/nak_nir_lower_image_addrs.c
+index 62c103c67838dfd088c61edb6f084b51bcb1e413..50dbf3f33bb2d95037bb1d8fd308a794a553395e 100644
+--- a/src/nouveau/compiler/nak_nir_lower_image_addrs.c
++++ b/src/nouveau/compiler/nak_nir_lower_image_addrs.c
+@@ -87,6 +87,192 @@ lower_formatted_image_load(nir_builder *b,
+    return rgba;
+ }
+ 
++/* Whether bit `index`, below 64, of `mask` is set. */
++static nir_def *
++test_format_bit(nir_builder *b, nir_def *index, uint64_t mask)
++{
++   /* A shift takes the low five bits of its count, so each word is shifted
++    * by the index within it.
++    */
++   nir_def *low = nir_ushr(b, nir_imm_int(b, (uint32_t)mask), index);
++   nir_def *high = nir_ushr(b, nir_imm_int(b, (uint32_t)(mask >> 32)), index);
++   nir_def *bit = nir_bcsel(b, nir_ilt_imm(b, index, 32), low, high);
++   return nir_ine_imm(b, nir_iand_imm(b, bit, 1), 0);
++}
++
++/* One raw suldga of `bits` bits of the texel, as four zero-padded words. */
++static nir_def *
++load_raw_texel(nir_builder *b, nir_def *addr, nir_def *fmt, nir_def *is_oob,
++               unsigned bits, enum gl_access_qualifier access,
++               enum nak_su_ga_offset_mode offset_mode)
++{
++   const unsigned num_words = DIV_ROUND_UP(bits, 32);
++   nir_def *raw = nir_suldga_nv(b, num_words, addr, fmt, is_oob,
++                                .format = format_for_bits(bits),
++                                .access = access,
++                                .flags = offset_mode);
++   nir_def *words[4];
++   for (unsigned i = 0; i < 4; i++)
++      words[i] = i < num_words ? nir_channel(b, raw, i) : nir_imm_int(b, 0);
++   if (bits < 32)
++      words[0] = nir_iand_imm(b, words[0], BITFIELD_MASK(bits));
++   return nir_vec(b, words, 4);
++}
++
++/* A load whose format neither the intrinsic nor the variable names.
++ *
++ * Kepler's suldga returns raw texels, which the shader unpacks, so NVK needs
++ * the format when it compiles the shader and does not have
++ * shaderStorageImageReadWithoutFormat there. The image view's format is in
++ * its descriptor all the same: format_info holds the hardware's format
++ * number with the size and count of its components, which sustga converts
++ * stores by. So read it there and unpack as that format asks: the texel's
++ * bits decide which suldga loads it, and the format's kind decides the
++ * conversion, each kind unpacked as its four-component format of that
++ * component size, with the components the format lacks filled in after.
++ *
++ * The formats are those of nil's su_info.rs (format_info), which are all
++ * that a Kepler storage descriptor can hold.
++ */
++static nir_def *
++lower_formatless_image_load(nir_builder *b, nir_def *addr, nir_def *fmt,
++                            nir_def *is_oob,
++                            enum gl_access_qualifier access,
++                            enum nak_su_ga_offset_mode offset_mode)
++{
++   /* GK104_IMAGE_FORMAT numbers by kind, as bit masks. */
++   const uint64_t float_formats =
++      BITFIELD64_BIT(0x02) | BITFIELD64_BIT(0x0c) | BITFIELD64_BIT(0x0d) |
++      BITFIELD64_BIT(0x21) | BITFIELD64_BIT(0x29) | BITFIELD64_BIT(0x36);
++   const uint64_t sint_formats =
++      BITFIELD64_BIT(0x03) | BITFIELD64_BIT(0x0a) | BITFIELD64_BIT(0x1b) |
++      BITFIELD64_BIT(0x0e) | BITFIELD64_BIT(0x1f) | BITFIELD64_BIT(0x30) |
++      BITFIELD64_BIT(0x27) | BITFIELD64_BIT(0x34) | BITFIELD64_BIT(0x39);
++   const uint64_t uint_formats =
++      BITFIELD64_BIT(0x04) | BITFIELD64_BIT(0x0b) | BITFIELD64_BIT(0x1c) |
++      BITFIELD64_BIT(0x0f) | BITFIELD64_BIT(0x20) | BITFIELD64_BIT(0x31) |
++      BITFIELD64_BIT(0x28) | BITFIELD64_BIT(0x35) | BITFIELD64_BIT(0x3a);
++   const uint64_t unorm_formats =
++      BITFIELD64_BIT(0x08) | BITFIELD64_BIT(0x18) | BITFIELD64_BIT(0x1d) |
++      BITFIELD64_BIT(0x2e) | BITFIELD64_BIT(0x32) | BITFIELD64_BIT(0x37);
++   const uint64_t snorm_formats =
++      BITFIELD64_BIT(0x09) | BITFIELD64_BIT(0x1a) | BITFIELD64_BIT(0x1e) |
++      BITFIELD64_BIT(0x2f) | BITFIELD64_BIT(0x33) | BITFIELD64_BIT(0x38);
++   /* The packed formats, each of one 32-bit word. */
++   static const struct {
++      uint8_t hw;
++      enum pipe_format format;
++   } packed_formats[] = {
++      { 0x11, PIPE_FORMAT_B8G8R8A8_UNORM },
++      { 0x13, PIPE_FORMAT_R10G10B10A2_UNORM },
++      { 0x15, PIPE_FORMAT_R10G10B10A2_UINT },
++      { 0x24, PIPE_FORMAT_R11G11B10_FLOAT },
++   };
++
++   nir_def *hw = nir_iand_imm(b, fmt, 0xff);
++   /* 0 => 32 bits, 1 => 16, 2 => 8 */
++   nir_def *size = nir_ubitfield_extract_imm(b, fmt, 8, 2);
++   /* 0 => 1 component, 1 => 2, 2 => 4 */
++   nir_def *count = nir_ubitfield_extract_imm(b, fmt, 10, 2);
++   /* 3 => 8 bits, ..., 7 => 128 */
++   nir_def *bits_log2 = nir_iadd(b, nir_isub_imm(b, 5, size), count);
++
++   /* Only the texel's own bits may be loaded: more would read past the
++    * image's last texel.
++    */
++   nir_def *raw = NULL;
++   static const unsigned load_bits[] = { 128, 64, 32, 16 };
++   nir_def *loaded[ARRAY_SIZE(load_bits)];
++   for (unsigned i = 0; i < ARRAY_SIZE(load_bits); i++) {
++      nir_push_if(b, nir_ieq_imm(b, bits_log2, util_logbase2(load_bits[i])));
++      loaded[i] = load_raw_texel(b, addr, fmt, is_oob, load_bits[i],
++                                 access, offset_mode);
++      nir_push_else(b, NULL);
++   }
++   raw = load_raw_texel(b, addr, fmt, is_oob, 8, access, offset_mode);
++   for (int i = ARRAY_SIZE(load_bits) - 1; i >= 0; i--) {
++      nir_pop_if(b, NULL);
++      raw = nir_if_phi(b, loaded[i], raw);
++   }
++
++   nir_def *is_32 = nir_ieq_imm(b, size, 0);
++   nir_def *is_16 = nir_ieq_imm(b, size, 1);
++   nir_def *words_2 = nir_trim_vector(b, raw, 2);
++   nir_def *words_1 = nir_trim_vector(b, raw, 1);
++
++   nir_def *rgba = nir_imm_ivec4(b, 0, 0, 0, 0);
++
++   nir_def *as_float =
++      nir_bcsel(b, is_32,
++                nir_format_unpack_rgba(b, raw, PIPE_FORMAT_R32G32B32A32_FLOAT),
++                nir_format_unpack_rgba(b, words_2,
++                                       PIPE_FORMAT_R16G16B16A16_FLOAT));
++   rgba = nir_bcsel(b, test_format_bit(b, hw, float_formats), as_float, rgba);
++
++   nir_def *as_sint =
++      nir_bcsel(b, is_32,
++                nir_format_unpack_rgba(b, raw, PIPE_FORMAT_R32G32B32A32_SINT),
++      nir_bcsel(b, is_16,
++                nir_format_unpack_rgba(b, words_2,
++                                       PIPE_FORMAT_R16G16B16A16_SINT),
++                nir_format_unpack_rgba(b, words_1,
++                                       PIPE_FORMAT_R8G8B8A8_SINT)));
++   nir_def *is_sint = test_format_bit(b, hw, sint_formats);
++   rgba = nir_bcsel(b, is_sint, as_sint, rgba);
++
++   nir_def *as_uint =
++      nir_bcsel(b, is_32,
++                nir_format_unpack_rgba(b, raw, PIPE_FORMAT_R32G32B32A32_UINT),
++      nir_bcsel(b, is_16,
++                nir_format_unpack_rgba(b, words_2,
++                                       PIPE_FORMAT_R16G16B16A16_UINT),
++                nir_format_unpack_rgba(b, words_1,
++                                       PIPE_FORMAT_R8G8B8A8_UINT)));
++   nir_def *is_uint = test_format_bit(b, hw, uint_formats);
++   rgba = nir_bcsel(b, is_uint, as_uint, rgba);
++
++   nir_def *as_unorm =
++      nir_bcsel(b, is_16,
++                nir_format_unpack_rgba(b, words_2,
++                                       PIPE_FORMAT_R16G16B16A16_UNORM),
++                nir_format_unpack_rgba(b, words_1,
++                                       PIPE_FORMAT_R8G8B8A8_UNORM));
++   rgba = nir_bcsel(b, test_format_bit(b, hw, unorm_formats), as_unorm, rgba);
++
++   nir_def *as_snorm =
++      nir_bcsel(b, is_16,
++                nir_format_unpack_rgba(b, words_2,
++                                       PIPE_FORMAT_R16G16B16A16_SNORM),
++                nir_format_unpack_rgba(b, words_1,
++                                       PIPE_FORMAT_R8G8B8A8_SNORM));
++   rgba = nir_bcsel(b, test_format_bit(b, hw, snorm_formats), as_snorm, rgba);
++
++   /* What the format lacks reads as 0, 0, 1: an integer 1 in an integer
++    * format and 1.0 in any other.
++    */
++   nir_def *one = nir_bcsel(b, nir_ior(b, is_sint, is_uint),
++                            nir_imm_int(b, 1), nir_imm_float(b, 1.0));
++   nir_def *channels[4] = {
++      nir_channel(b, rgba, 0),
++      nir_bcsel(b, nir_ieq_imm(b, count, 0), nir_imm_int(b, 0),
++                nir_channel(b, rgba, 1)),
++      nir_bcsel(b, nir_ieq_imm(b, count, 2), nir_channel(b, rgba, 2),
++                nir_imm_int(b, 0)),
++      nir_bcsel(b, nir_ieq_imm(b, count, 2), nir_channel(b, rgba, 3), one),
++   };
++   rgba = nir_vec(b, channels, 4);
++
++   /* The packed formats have four components of their own. */
++   for (unsigned i = 0; i < ARRAY_SIZE(packed_formats); i++) {
++      nir_def *unpacked =
++         nir_format_unpack_rgba(b, words_1, packed_formats[i].format);
++      rgba = nir_bcsel(b, nir_ieq_imm(b, hw, packed_formats[i].hw),
++                       unpacked, rgba);
++   }
++
++   return rgba;
++}
++
+ static nir_def *
+ load_su_info_clamp(nir_builder *b, nir_deref_instr *deref,
+                    unsigned xyz)
+@@ -448,6 +634,16 @@ lower_image_access(nir_builder *b, nir_intrinsic_instr *intrin)
+    case nir_intrinsic_image_deref_load: {
+       // .format intrinsic index is only used to pass how many bits to store
+       nir_def *fmt = load_su_info(b, deref, format_info);
++      if (format == PIPE_FORMAT_NONE) {
++         assert(intrin->def.bit_size == 32);
++         nir_def *rgba =
++            lower_formatless_image_load(b, addr, fmt, is_oob,
++                                        nir_intrinsic_access(intrin),
++                                        offset_mode);
++         nir_def_rewrite_uses(&intrin->def,
++                              nir_trim_vector(b, rgba, num_dst_components));
++         break;
++      }
+       nir_def *new_ssa = nir_suldga_nv(b, num_dst_components, addr, fmt,
+                                        is_oob,
+                                        .format = format,
+diff --git a/src/nouveau/vulkan/nvk_buffer_view.c b/src/nouveau/vulkan/nvk_buffer_view.c
+index a056acbe42fe4f43cbce5f7b67ce230f44f7fb3c..0ee84a06eea274e174659bfe4bbbe9dad9767806 100644
+--- a/src/nouveau/vulkan/nvk_buffer_view.c
++++ b/src/nouveau/vulkan/nvk_buffer_view.c
+@@ -31,9 +31,8 @@ nvk_get_buffer_format_features(const struct nvk_physical_device *pdev,
+ 
+       if (nvk_format_supports_storage(pdev, p_format)) {
+          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+-                     VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+-         if (pdev->info.cls_eng3d >= MAXWELL_A)
+-            features |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
++                     VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
++                     VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+       }
+ 
+       if (nvk_format_supports_atomics(pdev, p_format))
+diff --git a/src/nouveau/vulkan/nvk_image.c b/src/nouveau/vulkan/nvk_image.c
+index e9ce464c03b86e7c76274585f383636f0534982d..c715f2dca4bda985623fb222772c90d0132db4a4 100644
+--- a/src/nouveau/vulkan/nvk_image.c
++++ b/src/nouveau/vulkan/nvk_image.c
+@@ -92,9 +92,8 @@ nvk_get_image_plane_format_features(const struct nvk_physical_device *pdev,
+ 
+    if (nvk_format_supports_storage(pdev, p_format)) {
+       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+-                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+-      if (pdev->info.cls_eng3d >= MAXWELL_A)
+-         features |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
++                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
++                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+    }
+ 
+    if (nvk_format_supports_atomics(pdev, p_format))
+diff --git a/src/nouveau/vulkan/nvk_physical_device.c b/src/nouveau/vulkan/nvk_physical_device.c
+index 22416126eb3bf82ef56d28a7bc690ac47786fb34..86bdb198d6661d5d6a7f8cc44c0986ef5298d496 100644
+--- a/src/nouveau/vulkan/nvk_physical_device.c
++++ b/src/nouveau/vulkan/nvk_physical_device.c
+@@ -369,7 +369,10 @@ nvk_get_device_features(const struct nv_device_info *info,
+       .shaderImageGatherExtended = true,
+       .shaderStorageImageExtendedFormats = true,
+       .shaderStorageImageMultisample = true,
+-      .shaderStorageImageReadWithoutFormat = info->cls_eng3d >= MAXWELL_A,
++      /* Kepler reads the format from the image's descriptor
++       * (nak_nir_lower_image_addrs).
++       */
++      .shaderStorageImageReadWithoutFormat = true,
+       .shaderStorageImageWriteWithoutFormat = true,
+       .shaderUniformBufferArrayDynamicIndexing = true,
+       .shaderSampledImageArrayDynamicIndexing = true,

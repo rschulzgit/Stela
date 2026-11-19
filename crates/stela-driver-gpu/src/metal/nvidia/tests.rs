@@ -601,3 +601,88 @@ fn linear_and_texture_buffer_alignments() {
         0
     );
 }
+
+/// What the Metal device of a Kepler GPU is, by the fixture's model of NVK
+/// there with Stela's patches: it opens, since NAK compiles what the two
+/// features NVK does not report stand for, and holds the common and Mac
+/// families, as a Mac's own discrete GPU of its years did. No Apple family:
+/// the first that Core Animation presents on, Apple3, needs raster order
+/// groups, which need the fragment shader interlock NVK has from Maxwell B.
+/// No Metal 3 either, for want of mesh shaders.
+#[test]
+fn a_kepler_gpu_opens_with_the_common_and_mac_families() {
+    let chip = Chip::find(0x0e6).unwrap();
+    let device = nvk(chip, 2 << 30);
+    let features = &device.features;
+    assert!(!features.shader_float16 && !features.vulkan_memory_model);
+    assert!(features.shader_storage_image_read_without_format);
+    assert!(
+        crate::metal::vulkan::backend::requirements(&device)
+            .iter()
+            .all(|requirement| requirement.present)
+    );
+    // Another driver's device without the two stays refused, and NVK's
+    // without storage reads does too.
+    let missing = |device: &crate::metal::vulkan::physical::PhysicalDevice| {
+        crate::metal::vulkan::backend::requirements(device)
+            .iter()
+            .filter(|requirement| !requirement.present)
+            .map(|requirement| requirement.name)
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let mut other = device.clone();
+    other.identity.driver_id = DriverId::MesaRadv;
+    assert_eq!(missing(&other), ["shaderFloat16", "vulkanMemoryModel"]);
+    let mut unpatched = device.clone();
+    unpatched.features.shader_storage_image_read_without_format = false;
+    assert_eq!(missing(&unpatched), ["storageImageWithoutFormat"]);
+
+    let capabilities = Capabilities::derive(
+        &device,
+        &chip.platform(attachment()),
+        ShaderFeatures::KNOWN,
+        ApiFeatures::IMPLEMENTED,
+    );
+    assert_eq!(
+        capabilities.families(),
+        [
+            GpuFamily::Common1,
+            GpuFamily::Common2,
+            GpuFamily::Common3,
+            GpuFamily::Mac1,
+            GpuFamily::Mac2,
+            GpuFamily::MacCatalyst1,
+            GpuFamily::MacCatalyst2,
+        ]
+    );
+    assert_eq!(
+        capabilities.read_write_texture_tier,
+        ReadWriteTextureTier::Tier2
+    );
+    assert!(!capabilities.framebuffer_reads && !capabilities.fragment_tests);
+    let cause = |name: &str| {
+        capabilities
+            .gaps()
+            .iter()
+            .find(|gap| gap.capability == name)
+            .map(|gap| gap.cause)
+    };
+    for gap in [
+        "raster order groups",
+        "sparse textures",
+        "mesh shaders",
+        "GPU family Metal3",
+        "stencil feedback",
+    ] {
+        assert_eq!(cause(gap), Some(Cause::Driver), "{gap}");
+    }
+    for held in [
+        "read-write textures",
+        "read-write texture tier 2",
+        "GPU family Common3",
+        "GPU family Mac2",
+        "tessellation",
+    ] {
+        assert_eq!(cause(held), None, "{held}");
+    }
+}

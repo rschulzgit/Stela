@@ -20,7 +20,7 @@ use super::{
         IndirectCommandsLayoutInfo, Memory, MemoryRequest, Pipeline, PipelineCache, QueryPool,
         QueryPoolInfo, Sampler, SamplerInfo, Semaphore, SparseImageRequirements,
     },
-    physical::{Features, PhysicalDevice},
+    physical::PhysicalDevice,
 };
 use crate::metal::{
     binding::HeapArray,
@@ -514,13 +514,32 @@ pub struct Requirement {
 /// promises that `GENERAL` costs nothing beside the optimal layouts, and
 /// lets `GENERAL` stand for the attachment feedback loop and video layouts,
 /// which the layer never uses. The device enables it when offered.
-pub fn requirements(features: &Features) -> [Requirement; 19] {
+///
+/// Two of them a device of NVK's need not report, since they are promises
+/// about SPIR-V, and the layer hands NVK its shaders as NIR, which NAK
+/// compiles on every shader model (`nvidia/tests/kepler_nak.c` compiles
+/// both for Kepler's):
+///
+/// - `shaderFloat16`, which NVK reports from SM70 (Turing): below it NAK
+///   widens 16-bit float arithmetic to 32 bits itself (`nak_nir.c`
+///   `lower_bit_size_cb`) and converts between the two natively (`OpF2F`).
+///   Each sum, product, quotient and root rounds as its 16-bit one does,
+///   32-bit floats being wide enough for that.
+/// - `vulkanMemoryModel`, which NVK reports from Maxwell: NAK compiles the
+///   scoped barriers the layer emits (`MEMBAR`, `CCTL`) for Kepler too.
+///
+/// Storage reads without a format NVK reports on Kepler by Stela's patch to
+/// it, which unpacks a texel by the format in the image's descriptor
+/// (`third_party/patches/mesa`, `nvidia/tests/formatless_load.c`).
+pub fn requirements(device: &PhysicalDevice) -> [Requirement; 19] {
+    let features = &device.features;
+    let nak = device.identity.driver_id == super::DriverId::MesaNvk;
     let requirement = |name, present| Requirement { name, present };
     [
         requirement("bufferDeviceAddress", features.buffer_device_address),
         requirement("timelineSemaphore", features.timeline_semaphore),
         requirement("synchronization2", features.synchronization2),
-        requirement("shaderFloat16", features.shader_float16),
+        requirement("shaderFloat16", features.shader_float16 || nak),
         requirement("dynamicRendering", features.dynamic_rendering),
         requirement(
             "descriptorIndexing",
@@ -551,7 +570,7 @@ pub fn requirements(features: &Features) -> [Requirement; 19] {
             "maintenance5",
             features.maintenance4 && features.maintenance5,
         ),
-        requirement("vulkanMemoryModel", features.vulkan_memory_model),
+        requirement("vulkanMemoryModel", features.vulkan_memory_model || nak),
         requirement(
             "storageImageWithoutFormat",
             features.shader_storage_image_read_without_format

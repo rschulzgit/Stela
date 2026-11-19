@@ -201,12 +201,11 @@ pub fn describe(physical: &PhysicalDevice) -> String {
     });
     // Every requirement of the Metal device the Vulkan device lacks, where
     // the device's own refusal names only the first.
-    let missing: alloc::vec::Vec<&str> =
-        crate::metal::vulkan::backend::requirements(&physical.features)
-            .iter()
-            .filter(|requirement| !requirement.present)
-            .map(|requirement| requirement.name)
-            .collect();
+    let missing: alloc::vec::Vec<&str> = crate::metal::vulkan::backend::requirements(physical)
+        .iter()
+        .filter(|requirement| !requirement.present)
+        .map(|requirement| requirement.name)
+        .collect();
     if !missing.is_empty() {
         line.push_str(" missing-requirements=");
         line.push_str(&missing.join(","));
@@ -575,7 +574,8 @@ mod tests {
         ));
         assert!(line.contains(" heaps: "));
         assert!(!line.contains("missing-requirements"));
-        // What NVK lacks on Kepler of the Metal device's requirements.
+        // What an unpatched NVK lacks on Kepler of the requirements, on a
+        // driver whose compiler is not known to make up for any of it.
         let features = &mut backend.physical.as_mut().unwrap().features;
         features.shader_float16 = false;
         features.vulkan_memory_model = false;
@@ -584,6 +584,10 @@ mod tests {
         assert!(line.ends_with(
             " missing-requirements=shaderFloat16,vulkanMemoryModel,storageImageWithoutFormat"
         ));
+        // NAK compiles the first two for every shader model.
+        backend.physical.as_mut().unwrap().identity.driver_id = DriverId::MesaNvk;
+        let line = describe(backend.physical.as_ref().unwrap());
+        assert!(line.ends_with(" missing-requirements=storageImageWithoutFormat"));
     }
 
     #[test]

@@ -157,6 +157,14 @@ if with_nvidia
     link_with : [stela_metal_abi, stela_nak],
   )
   test('stela_metal_abi_nak', stela_metal_abi_nak_test, suite : 'stela')
+  stela_metal_abi_kepler_test = executable(
+    'stela_metal_abi_kepler_test',
+    'tests/metal_abi_kepler.c',
+    include_directories : [inc_include, inc_src, inc_gpu, nvidia_headers],
+    dependencies : [idep_nir, idep_mesautil, idep_nak],
+    link_with : [stela_metal_abi, stela_nak],
+  )
+  test('stela_metal_abi_kepler', stela_metal_abi_kepler_test, suite : 'stela')
 endif
 
 if with_amd_llvm
@@ -533,6 +541,26 @@ if with_nvidia
     link_with : [stela_nvidia_image],
   )
   test('stela_nvidia_image_copy', stela_nvidia_image_copy_test, suite : 'stela')
+  # NVK's Kepler lowering of storage reads without a format (Stela's patch to
+  # nak_nir_lower_image_addrs), folded against the reads with their format.
+  stela_nvidia_formatless_load_test = executable(
+    'stela_nvidia_formatless_load_test',
+    '../nvidia/tests/formatless_load.c',
+    include_directories : [inc_include, inc_src, inc_gpu, nvidia_headers],
+    dependencies : [idep_nir, idep_mesautil, idep_nak, idep_nil],
+    link_with : stela_nak,
+  )
+  test('stela_nvidia_formatless_load', stela_nvidia_formatless_load_test, suite : 'stela')
+  # Half floats and scoped barriers on the Kepler shader model, which NVK
+  # reports no feature for and the Metal layer's requirements waive.
+  stela_nvidia_kepler_nak_test = executable(
+    'stela_nvidia_kepler_nak_test',
+    '../nvidia/tests/kepler_nak.c',
+    include_directories : [inc_include, inc_src, inc_gpu, nvidia_headers],
+    dependencies : [idep_nir, idep_mesautil, idep_nak],
+    link_with : stela_nak,
+  )
+  test('stela_nvidia_kepler_nak', stela_nvidia_kepler_nak_test, suite : 'stela')
   stela_nvidia_sampler = static_library(
     'stela_nvidia_sampler',
     '../nvidia/hosted/sampler.c',

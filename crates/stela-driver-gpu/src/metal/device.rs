@@ -355,7 +355,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// binding ABI or command model relies on.
     pub fn new(mut backend: B, compiler: C, platform: &Platform) -> Result<Self> {
         let physical = backend.physical_device();
-        if let Some(missing) = requirements(&physical.features)
+        if let Some(missing) = requirements(physical)
             .iter()
             .find(|requirement| !requirement.present)
         {

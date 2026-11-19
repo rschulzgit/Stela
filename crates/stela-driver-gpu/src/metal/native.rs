@@ -728,7 +728,7 @@ impl NativeBackend {
             destroy_instance(&instance);
             return Err(Error::Unsupported("Vulkan device of the GPU"));
         };
-        if let Some(missing) = requirements(&snapshot.features)
+        if let Some(missing) = requirements(&snapshot)
             .iter()
             .find(|requirement| !requirement.present)
         {

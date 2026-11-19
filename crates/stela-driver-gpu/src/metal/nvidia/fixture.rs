@@ -49,6 +49,67 @@ pub(crate) fn capabilities() -> Capabilities {
 }
 
 pub(crate) fn nvk(chip: &Chip, vram: u64) -> PhysicalDevice {
+    let mut device = turing_and_later(chip, vram);
+    if chip.architecture == Architecture::Kepler {
+        kepler(&mut device);
+    }
+    device
+}
+
+/// What NVK reports differently on the Kepler A class (GK104, GK106, GK107),
+/// by the class and shader-model conditions of `nvk_physical_device.c`:
+/// Vulkan 1.2, and none of what it keys on Kepler B, Maxwell, Volta or
+/// Turing and on SM70. Storage reads without a format stay: Stela's patch
+/// to NVK gives Kepler those.
+fn kepler(device: &mut PhysicalDevice) {
+    device.identity.api_version = (1 << 22) | (2 << 12);
+    // The Quadro K2100M.
+    device.identity.device_id = 0x11fc;
+    let features = &mut device.features;
+    // SM70.
+    features.shader_float16 = false;
+    features.shader_float16_vector_atomics = false;
+    // Kepler B.
+    features.shader_buffer_int64_atomics = false;
+    features.shader_shared_int64_atomics = false;
+    features.shader_image_int64_atomics = false;
+    // Maxwell A and B.
+    features.vulkan_memory_model = false;
+    features.vulkan_memory_model_device_scope = false;
+    features.sparse_binding = false;
+    features.sparse_residency_buffer = false;
+    features.sparse_residency_image_2d = false;
+    features.sparse_residency_image_3d = false;
+    features.sparse_residency_samples = SampleCounts::EMPTY;
+    features.sparse_residency_aliased = false;
+    features.sampler_filter_minmax = false;
+    features.fragment_shader_pixel_interlock = false;
+    // Volta.
+    features.shader_resource_residency = false;
+    features.shader_resource_min_lod = false;
+    // Turing.
+    features.host_image_copy = false;
+    features.fragment_shader_barycentric = false;
+    features.task_shader = false;
+    features.mesh_shader = false;
+    features.cooperative_matrix = false;
+    let limits = &mut device.limits;
+    limits.buffer_image_granularity = 0x10000;
+    limits.sparse_address_space_size = 0;
+    limits.sample_locations = None;
+    limits.mesh = None;
+    limits.generated_commands = None;
+    limits.sparse = SparseLimits {
+        residency_standard_2d_block_shape: false,
+        residency_standard_2d_multisample_block_shape: false,
+        residency_standard_3d_block_shape: false,
+        residency_aligned_mip_size: false,
+        residency_non_resident_strict: false,
+    };
+    device.formats = formats(true);
+}
+
+fn turing_and_later(chip: &Chip, vram: u64) -> PhysicalDevice {
     PhysicalDevice {
         identity: Identity {
             api_version: (1 << 22) | (4 << 12),
@@ -105,7 +166,7 @@ pub(crate) fn nvk(chip: &Chip, vram: u64) -> PhysicalDevice {
                 },
             ],
         },
-        formats: formats(),
+        formats: formats(false),
     }
 }
 
@@ -340,7 +401,10 @@ fn features(chip: &Chip) -> Features {
     }
 }
 
-fn formats() -> FormatTable {
+/// `kepler`: without what NVK gives a format only from Maxwell or Turing
+/// (`nvk_image.c`, `nvk_format.c`): min-max filtering, host image copies and
+/// sparse binding.
+fn formats(kepler: bool) -> FormatTable {
     let mut table = FormatTable::default();
     let transfer = F::TRANSFER_SRC | F::TRANSFER_DST | F::BLIT_SRC | F::HOST_IMAGE_TRANSFER;
     for format in PixelFormat::ALL {
@@ -422,6 +486,19 @@ fn formats() -> FormatTable {
                 ..FormatSupport::default()
             },
             _ => continue,
+        };
+        let support = if kepler {
+            let later = F::SAMPLED_IMAGE_FILTER_MINMAX | F::HOST_IMAGE_TRANSFER;
+            FormatSupport {
+                optimal: support.optimal.difference(later),
+                linear: support.linear.difference(later),
+                modifier_linear: support.modifier_linear.difference(later),
+                buffer: support.buffer.difference(later),
+                sparse: SampleCounts::EMPTY,
+                ..support
+            }
+        } else {
+            support
         };
         table.insert(realization.format, support);
     }
