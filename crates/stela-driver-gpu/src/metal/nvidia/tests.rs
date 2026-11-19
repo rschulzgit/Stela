@@ -61,6 +61,53 @@ fn the_chip_table_is_nouveaus_turing_and_later_list() {
 }
 
 #[test]
+fn kepler_chips_are_admitted_with_their_own_linear_alignment_and_no_sparse_pages() {
+    assert!(
+        KEPLER_CHIPS
+            .windows(2)
+            .all(|pair| pair[0].chipset < pair[1].chipset)
+    );
+    assert!(
+        KEPLER_CHIPS
+            .iter()
+            .all(|chip| chip.chipset < FIRST_GSP_CHIPSET)
+    );
+    // GK106: the Quadro K2100M.
+    let gk106 = Chip::find(0x0e6).unwrap();
+    assert_eq!(
+        (gk106.name, gk106.architecture),
+        ("GK106", Architecture::Kepler)
+    );
+    let identity = nvk(gk106, 2 << 30).identity;
+    assert_eq!(Chip::admit(&identity, 0x0e6), Ok(gk106));
+    let platform = gk106.platform(attachment());
+    assert_eq!(platform.architecture, "GK106");
+    assert_eq!(
+        (
+            platform.linear_row_alignment,
+            platform.linear_offset_alignment
+        ),
+        (256, 256)
+    );
+    assert_eq!(platform.sparse_page_bytes, 0);
+    assert!(!platform.headless);
+    // A GSP-RM chip keeps its own.
+    let turing = Chip::find(0x167).unwrap().platform(attachment());
+    assert_eq!(
+        (turing.linear_row_alignment, turing.linear_offset_alignment),
+        (32, 32)
+    );
+    assert_eq!(turing.sparse_page_bytes, 64 << 10);
+    // Maxwell and Pascal stay refused: neither table holds them.
+    for chipset in [0x117, 0x124, 0x134, 0x140] {
+        assert_eq!(
+            Chip::admit(&identity, chipset),
+            Err(Refusal::PreTuring { chipset })
+        );
+    }
+}
+
+#[test]
 fn admission_requires_an_nvk_discrete_gsp_chip() {
     let chip = Chip::find(0x1b3).unwrap();
     let identity = nvk(chip, 16 << 30).identity;

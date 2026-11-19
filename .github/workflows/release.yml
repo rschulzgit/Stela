@@ -3,12 +3,15 @@
 # So the chain runs: Stela.app (macOS) -> stela.efi (Linux) -> stela for
 # Linux, Windows and macOS -> release.
 #
-# Runs only for a pushed `v*` tag, and publishes that tag's release.
+# Runs for a pushed `v*` tag, and publishes that tag's release. Started by
+# hand on a branch (Actions, "Run workflow") it builds the same archives and
+# leaves them as the run's artifacts, publishing nothing: a test build.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -47,7 +50,7 @@ jobs:
             echo "::error::Cargo.toml has no [workspace.package] version"
             exit 1
           fi
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF_NAME" != "v$version" ]]; then
             echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
             exit 1
           fi
@@ -357,6 +360,8 @@ jobs:
 
   release:
     needs: [version, cli]
+    # A test build started by hand has no tag to publish.
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

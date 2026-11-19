@@ -15,6 +15,7 @@
 //! environment with nothing to do costs the boot PE one comparison a slice.
 #[cfg(feature = "nvk")]
 pub(super) mod acpi_backlight;
+mod acpi_rom;
 mod before;
 #[cfg(feature = "nvk")]
 pub(super) mod client;
@@ -186,9 +187,14 @@ pub(super) unsafe fn keep_video_bios_table(rsdp: u64, root: u64) {
 }
 
 /// The function's image in the kept VFCT table, as Linux takes it
-/// (`amdgpu_acpi_vfct_bios`), or nothing; a refused image is said once.
+/// (`amdgpu_acpi_vfct_bios`), or nothing; a refused image is said once. An
+/// NVIDIA function's is the one its ACPI companion's `_ROM` gave
+/// (`acpi_rom`), which only a GPU before Turing has read.
 fn platform_rom(adapter: &gpu::Adapter) -> &'static [u8] {
     use stela_boot_core::vfct;
+    if adapter.vendor == gpu::Vendor::Nvidia {
+        return acpi_rom::image(adapter.address);
+    }
     // SAFETY: stored once before any claim and never freed.
     let Some(table) = (unsafe { VIDEO_BIOS_TABLE.load(Ordering::Acquire).as_ref() }) else {
         return &[];

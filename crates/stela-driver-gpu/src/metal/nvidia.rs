@@ -1,5 +1,6 @@
-//! NVIDIA GPUs under Stela's Metal device: nouveau with GSP firmware in the
-//! kernel and NVK as the Vulkan driver.
+//! NVIDIA GPUs under Stela's Metal device: nouveau in the kernel, with GSP
+//! firmware from Turing on and by itself on Kepler, and NVK as the Vulkan
+//! driver.
 //!
 //! Hardware access, firmware, memory management, command submission and
 //! shader code generation stay with nouveau, NVK and NAK; this module only
@@ -15,7 +16,7 @@ use alloc::string::String;
 
 pub const VENDOR_ID: u32 = 0x10de;
 
-pub use crate::nouveau_chip::{Architecture, CHIPS, Chip};
+pub use crate::nouveau_chip::{Architecture, CHIPS, Chip, KEPLER_CHIPS};
 
 /// The first Turing chipset; nouveau's card type for 0x160-0x16f is TU100.
 const FIRST_GSP_CHIPSET: u16 = 0x160;
@@ -28,7 +29,8 @@ pub enum Refusal {
     },
     /// Only NVK is integrated with Stela's nouveau winsys.
     NotNvk(DriverId),
-    /// Chips before Turing have no GSP firmware path.
+    /// Chips before Turing have no GSP firmware path, and only Kepler's
+    /// ([`KEPLER_CHIPS`]) have nouveau's own.
     PreTuring {
         chipset: u16,
     },
@@ -55,10 +57,16 @@ impl Chip {
         if identity.device_type != PhysicalDeviceType::DiscreteGpu {
             return Err(Refusal::NotDiscrete(identity.device_type));
         }
+        // Either table's: a GSP-RM chip or a Kepler chip. What the Kepler
+        // chip's NVK lacks of the Metal device's requirements is the
+        // device's refusal, which names it.
+        if let Some(chip) = Self::find(chipset) {
+            return Ok(chip);
+        }
         if chipset < FIRST_GSP_CHIPSET {
             return Err(Refusal::PreTuring { chipset });
         }
-        Self::find(chipset).ok_or(Refusal::UnknownChipset { chipset })
+        Err(Refusal::UnknownChipset { chipset })
     }
 }
 
@@ -73,9 +81,13 @@ const LINEAR_OFFSET_ALIGNMENT: u64 = 32;
 /// nouveau's sparse binding uses the GPU's 64 KiB big pages, matching
 /// Vulkan's standard sparse block shapes.
 const SPARSE_PAGE_BYTES: u64 = 64 << 10;
+/// Kepler's image storage needs 256-byte aligned addresses, so NIL aligns a
+/// linear image's rows and NVK its offset to that (`Image::new_linear`).
+const KEPLER_LINEAR_ALIGNMENT: u64 = 256;
 
 impl Chip {
     pub fn platform(&self, attachment: Attachment) -> Platform {
+        let kepler = self.architecture == Architecture::Kepler;
         Platform {
             architecture: String::from(self.name),
             location: if attachment.external {
@@ -87,15 +99,24 @@ impl Chip {
             max_transfer_rate: attachment.link.bytes_per_second(),
             headless: !self.display,
             removable: attachment.external,
-            linear_row_alignment: LINEAR_ROW_ALIGNMENT,
-            linear_offset_alignment: LINEAR_OFFSET_ALIGNMENT,
-            sparse_page_bytes: SPARSE_PAGE_BYTES,
+            linear_row_alignment: if kepler {
+                KEPLER_LINEAR_ALIGNMENT
+            } else {
+                LINEAR_ROW_ALIGNMENT
+            },
+            linear_offset_alignment: if kepler {
+                KEPLER_LINEAR_ALIGNMENT
+            } else {
+                LINEAR_OFFSET_ALIGNMENT
+            },
+            // NVK binds no sparse memory before Maxwell B.
+            sparse_page_bytes: if kepler { 0 } else { SPARSE_PAGE_BYTES },
         }
     }
 }
 
 /// The NVIDIA stack's admission: nouveau's chipset must be one of [`CHIPS`]
-/// and the Vulkan device NVK's.
+/// or [`KEPLER_CHIPS`] and the Vulkan device NVK's.
 pub const ADMISSION: Admission = Admission { admit };
 
 fn admit(

@@ -118,9 +118,10 @@ pub static NVIDIA: GpuStack = GpuStack {
         // with a chip it does not know is its probe's answer.
         admits: |_| Ok(()),
         registers: 0,
-        // The Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c`
-        // 47, `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
-        dma_bits: |_| 47,
+        // The MMU's `dma_bits`, which `nvkm_device_pci_new` sets as the
+        // mask: 47 from Turing (`nvkm/subdev/mmu/tu102.c`; `gh100.c` 52), 40
+        // on Kepler (`gk104.c`).
+        dma_bits: |adapter| crate::nouveau_chip::dma_bits(adapter.device),
         // nouveau drives discrete GPUs only (`nvkm_device_pci_new`); Tegra's
         // built-in GPUs are platform devices, not PCI functions.
         integrated: |_| false,

@@ -199,6 +199,18 @@ pub fn describe(physical: &PhysicalDevice) -> String {
     } else {
         " host-visible-vram=no"
     });
+    // Every requirement of the Metal device the Vulkan device lacks, where
+    // the device's own refusal names only the first.
+    let missing: alloc::vec::Vec<&str> =
+        crate::metal::vulkan::backend::requirements(&physical.features)
+            .iter()
+            .filter(|requirement| !requirement.present)
+            .map(|requirement| requirement.name)
+            .collect();
+    if !missing.is_empty() {
+        line.push_str(" missing-requirements=");
+        line.push_str(&missing.join(","));
+    }
     line
 }
 
@@ -562,6 +574,16 @@ mod tests {
             "VULKAN DEVICE \"AMD Radeon RX 6800 XT (RADV NAVI21)\" 1002:73bf MesaRadv DiscreteGpu"
         ));
         assert!(line.contains(" heaps: "));
+        assert!(!line.contains("missing-requirements"));
+        // What NVK lacks on Kepler of the Metal device's requirements.
+        let features = &mut backend.physical.as_mut().unwrap().features;
+        features.shader_float16 = false;
+        features.vulkan_memory_model = false;
+        features.shader_storage_image_read_without_format = false;
+        let line = describe(backend.physical.as_ref().unwrap());
+        assert!(line.ends_with(
+            " missing-requirements=shaderFloat16,vulkanMemoryModel,storageImageWithoutFormat"
+        ));
     }
 
     #[test]

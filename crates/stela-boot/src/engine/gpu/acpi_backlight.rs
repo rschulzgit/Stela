@@ -62,6 +62,9 @@ pub(in crate::engine) fn load(
             ));
             continue;
         };
+        // A GPU before Turing has no GSP-RM to take the rest; nouveau needs
+        // its video BIOS, which only the companion's `_ROM` may hold.
+        super::acpi_rom::keep(adapter, path, device);
         let (backlight, from) = match table(device) {
             Ok(found) => found,
             Err(why) => (Vec::new(), why),

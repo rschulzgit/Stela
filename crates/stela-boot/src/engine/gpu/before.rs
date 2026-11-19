@@ -80,6 +80,9 @@ pub(super) fn of(stack: &GpuStack) -> Option<&'static Before> {
 
 /// nouveau: the chip is `PMC_BOOT_0`'s, its GSP-RM files are that chip's, and
 /// a Turing-to-Ada GPU's own firmware must have booted again after the reset.
+/// A Kepler chip has no GSP-RM and no file: nouveau posts it from its video
+/// BIOS and loads the engine firmware built into the driver
+/// ([`without_gsp`]).
 static NOUVEAU: Before = Before {
     // Its files are the chip's, which only its registers name.
     admits: |_, _| Ok(()),
@@ -95,6 +98,9 @@ static NOUVEAU: Before = Before {
         let chip = gpu::nouveau_chip::Chip::from_boot0(boot0).ok_or(ServiceError::Refused(
             "the GPU's PMC chipset is unsupported",
         ))?;
+        if !chip.runs_gsp() {
+            return without_gsp(observed.adapter, chip, boot0, catalog);
+        }
         let name = chip.name.to_ascii_lowercase();
         let mut inventory = Inventory::default();
         stela_loader::host_firmware::recipes::require_gsp(&mut inventory, &name)
@@ -116,6 +122,43 @@ static NOUVEAU: Before = Before {
         None => Ok(()),
     },
 };
+
+/// nouveau's part for a chip it runs without GSP-RM (Kepler): no file of
+/// the USB is the chip's, so none is approved, and whatever nouveau asks the
+/// firmware service for is answered as missing, as on a Linux without the
+/// optional files. After the claim's reset the GPU is as it comes out of
+/// D3cold: nouveau posts it from the video BIOS (`nvkm_devinit_post`), which
+/// it reads from the function's platform ROM when the GPU holds none
+/// (`acpi_rom`). Its BIOS and devinit lines are asked for at debug level,
+/// since they say which place gave the image and whether the post ran.
+fn without_gsp(
+    adapter: &gpu::Adapter,
+    chip: &'static gpu::nouveau_chip::Chip,
+    boot0: u32,
+    catalog: Arc<Catalog>,
+) -> Result<Identified, ServiceError> {
+    let target = FirmwareTarget::new(
+        String::from("nouveau"),
+        String::from("nvidia"),
+        String::from("linux-firmware"),
+        None,
+    )
+    .map_err(|_| ServiceError::Refused("the GPU firmware target is invalid"))?;
+    let firmware = PciFirmware::new(target, catalog, alloc::boxed::Box::default())
+        .map_err(|_| ServiceError::Refused("the GPU firmware selection is invalid"))?;
+    output::arguments(format_args!(
+        "GPU {}: {} (PMC_BOOT_0 {boot0:#010x}, PCI device {:04x}) runs without GSP-RM: no \
+         firmware file is the chip's, and nouveau posts it from its video BIOS\n",
+        adapter.address, chip.name, adapter.device
+    ));
+    Ok(Identified {
+        firmware,
+        identity: Some(boot0),
+        chip: Some(chip.name),
+        parameters: Some(String::from("nouveau.debug=bios=debug,devinit=debug")),
+        searched: Vec::new(),
+    })
+}
 
 /// amdgpu: the files are those its IP blocks ask for on the PCI device ID's
 /// GPU, as pinned. The driver reads which blocks the device has from the

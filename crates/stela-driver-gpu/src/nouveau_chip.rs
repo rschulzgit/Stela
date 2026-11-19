@@ -1,11 +1,15 @@
 //! Discrete NVIDIA chipset identity shared by boot and the NVK device path.
 //! The table follows nouveau's `nvkm_device_ctor` in
 //! `drivers/gpu/drm/nouveau/nvkm/engine/device/base.c` (Linux v7.2.12)
-//! for the GSP-RM chipsets starting at Turing.
+//! for the GSP-RM chipsets starting at Turing, and for the Kepler chipsets,
+//! which nouveau drives itself, without GSP-RM ([`KEPLER_CHIPS`]).
 
 /// The GPU generation, which fixes NVK's 3D class and NAK's shader model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Architecture {
+    /// GK104 to GK208: no GSP-RM. nouveau posts the GPU from its VBIOS and
+    /// loads its own built-in engine firmware, and NVK runs it at Vulkan 1.2.
+    Kepler,
     Turing,
     Ampere,
     Ada,
@@ -34,7 +38,7 @@ const fn chip(chipset: u16, name: &'static str, architecture: Architecture, disp
     }
 }
 
-use Architecture::{Ada, Ampere, Blackwell, Hopper, Turing};
+use Architecture::{Ada, Ampere, Blackwell, Hopper, Kepler, Turing};
 
 /// nouveau's Turing and later chipsets; GA100, GH100, GB100 and GB102 are
 /// compute parts without a display engine.
@@ -65,9 +69,47 @@ pub static CHIPS: [Chip; 24] = [
     chip(0x1b7, "GB207", Blackwell, true),
 ];
 
+/// nouveau's Kepler chipsets with a PCI function (`nve4_chipset` to
+/// `nv108_chipset`; GK20A, 0x0ea, is Tegra's). They are kept apart from
+/// [`CHIPS`], which stays the GSP-RM list: no GSP-RM release runs on them,
+/// so nouveau needs no file for them, only the GPU's own VBIOS.
+pub static KEPLER_CHIPS: [Chip; 7] = [
+    chip(0x0e4, "GK104", Kepler, true),
+    chip(0x0e6, "GK106", Kepler, true),
+    chip(0x0e7, "GK107", Kepler, true),
+    chip(0x0f0, "GK110", Kepler, true),
+    chip(0x0f1, "GK110B", Kepler, true),
+    chip(0x106, "GK208B", Kepler, true),
+    chip(0x108, "GK208", Kepler, true),
+];
+
+/// The PCI device IDs below Turing's first (TU102's 0x1e00): the functions
+/// whose chip may be one of [`KEPLER_CHIPS`]. Only the registers name the
+/// chip; this is what the boot can tell before it maps them.
+pub const fn before_turing(device: u16) -> bool {
+    device < 0x1e00
+}
+
+/// The mask nouveau sets for the function with PCI device ID `device`: its
+/// MMU's `dma_bits`, 47 from Turing (`nvkm/subdev/mmu/tu102.c`; `gh100.c`
+/// has 52) and 40 on Kepler (`gk104.c`). A function before Turing gets the
+/// narrower one, which every mapping nouveau makes for it fits.
+pub const fn dma_bits(device: u16) -> u8 {
+    if before_turing(device) { 40 } else { 47 }
+}
+
 impl Chip {
     pub fn find(chipset: u16) -> Option<&'static Chip> {
-        CHIPS.iter().find(|chip| chip.chipset == chipset)
+        CHIPS
+            .iter()
+            .chain(&KEPLER_CHIPS)
+            .find(|chip| chip.chipset == chipset)
+    }
+
+    /// Whether nouveau runs GSP-RM on the chip, and so asks for its files:
+    /// every chip of [`CHIPS`], none of [`KEPLER_CHIPS`].
+    pub fn runs_gsp(&self) -> bool {
+        !matches!(self.architecture, Kepler)
     }
 
     /// Decode the little-endian PMC_BOOT_0 of the actual register BAR.
@@ -205,6 +247,44 @@ mod tests {
         }
         assert_eq!(Chip::from_boot0(u32::MAX), None);
         assert_eq!(Chip::from_boot0(0), None);
+    }
+
+    #[test]
+    fn kepler_chips_are_found_and_run_without_gsp() {
+        for chip in &KEPLER_CHIPS {
+            let field = u32::from(chip.chipset) << 20;
+            assert_eq!(Chip::from_boot0(field | 0xa1), Some(chip));
+            assert_eq!(chip.architecture, Architecture::Kepler);
+            assert!(!chip.runs_gsp() && !chip.waits_for_firmware_boot());
+            assert!(chip.display);
+        }
+        assert!(CHIPS.iter().all(Chip::runs_gsp));
+        // The Quadro K2100M of a ThinkPad W541 is a GK106: PMC_BOOT_0
+        // 0x0e6xxxxx, PCI device 10de:11fc.
+        assert_eq!(
+            Chip::from_boot0(0x0e63_00a1).map(|chip| chip.name),
+            Some("GK106")
+        );
+        // GK20A is Tegra's and Maxwell has neither path here.
+        assert_eq!(Chip::find(0x0ea), None);
+        assert_eq!(Chip::find(0x117), None);
+        // No chipset is in both tables.
+        assert!(
+            KEPLER_CHIPS
+                .iter()
+                .all(|kepler| CHIPS.iter().all(|chip| chip.chipset != kepler.chipset))
+        );
+        assert!(Architecture::Kepler < Architecture::Turing);
+    }
+
+    #[test]
+    fn the_dma_mask_follows_the_generation_the_device_id_allows() {
+        // 10de:11fc (Quadro K2100M) and 10de:0ff6 (Quadro K1100M).
+        assert!(before_turing(0x11fc) && before_turing(0x0ff6));
+        assert_eq!((dma_bits(0x11fc), dma_bits(0x0ff6)), (40, 40));
+        // 10de:1e04 (RTX 2080 Ti) and 10de:2c02 (RTX 5080).
+        assert!(!before_turing(0x1e04) && !before_turing(0x2c02));
+        assert_eq!((dma_bits(0x1e04), dma_bits(0x2c02)), (47, 47));
     }
 
     #[test]
